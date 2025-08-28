@@ -167,6 +167,84 @@ class RCHTTPHandler(BaseHTTPRequestHandler):
                     }}
                 }});
         }}, 2000);
+        // ===== Gamepad support (Xbox controller via browser) =====
+        let prevButtons = {};
+        let gamepadConnected = false;
+        let lastSent = 0;
+        const sendIntervalMs = 33; // ~30Hz
+
+        window.addEventListener('gamepadconnected', (e) => {
+            gamepadConnected = true;
+            console.log('Gamepad connected:', e.gamepad.id);
+        });
+        window.addEventListener('gamepaddisconnected', () => {
+            gamepadConnected = false;
+            console.log('Gamepad disconnected');
+        });
+
+        function applyDeadzone(value, dz = 0.06) {
+            if (Math.abs(value) < dz) return 0;
+            return value;
+        }
+
+        function pollGamepadAndSend() {
+            const now = performance.now();
+            if (!gamepadConnected || (now - lastSent) < sendIntervalMs) {
+                requestAnimationFrame(pollGamepadAndSend);
+                return;
+            }
+
+            const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+            const gp = pads && pads[0];
+            if (!gp) {
+                requestAnimationFrame(pollGamepadAndSend);
+                return;
+            }
+
+            // Xbox standard mapping
+            const lsx = applyDeadzone(gp.axes[0] || 0); // rudder
+            const lsy = applyDeadzone(gp.axes[1] || 0); // throttle (invert)
+            const rsx = applyDeadzone(gp.axes[2] || 0); // aileron
+            const rsy = applyDeadzone(gp.axes[3] || 0); // elevator
+
+            const throttle = (1 - lsy) / 2; // map -1..1 to 1..0 then 0..1
+            const rudder = lsx;
+            const aileron = rsx;
+            const elevator = -rsy; // up is negative on most pads
+
+            // Buttons: A (0) toggles armed, B (1) cycles flight mode
+            const btnA = gp.buttons[0]?.pressed;
+            const btnB = gp.buttons[1]?.pressed;
+            let toggleArm = false;
+            let cycleMode = false;
+            if (btnA && !prevButtons[0]) toggleArm = true;
+            if (btnB && !prevButtons[1]) cycleMode = true;
+            prevButtons[0] = !!btnA;
+            prevButtons[1] = !!btnB;
+
+            const payload = { throttle, rudder, elevator, aileron, toggleArm, cycleMode };
+
+            fetch('/api/controls', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            }).catch(() => {});
+
+            // Update UI values
+            const setVal = (id, v) => {
+                const el = document.getElementById(id);
+                if (el) el.textContent = v.toFixed(2);
+            };
+            setVal('throttle-val', throttle);
+            setVal('rudder-val', rudder);
+            setVal('elevator-val', elevator);
+            setVal('aileron-val', aileron);
+
+            lastSent = now;
+            requestAnimationFrame(pollGamepadAndSend);
+        }
+
+        requestAnimationFrame(pollGamepadAndSend);
     </script>
 </body>
 </html>
@@ -211,6 +289,35 @@ class RCHTTPHandler(BaseHTTPRequestHandler):
                 send_rc_controls_to_phone()
                 
             self.wfile.write(json.dumps({'status': 'ok'}).encode())
+
+        elif path == '/api/controls':
+            # Bulk controls endpoint for browser Gamepad
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                post_data = self.rfile.read(content_length) if content_length > 0 else b'{}'
+                data = json.loads(post_data.decode())
+
+                rc_controls.throttle = float(data.get('throttle', rc_controls.throttle))
+                rc_controls.rudder = float(data.get('rudder', rc_controls.rudder))
+                rc_controls.elevator = float(data.get('elevator', rc_controls.elevator))
+                rc_controls.aileron = float(data.get('aileron', rc_controls.aileron))
+
+                if data.get('toggleArm'):
+                    rc_controls.armed = not rc_controls.armed
+                if data.get('cycleMode'):
+                    rc_controls.flight_mode = (rc_controls.flight_mode + 1) % 3
+
+                # Optional push to phone if reachable
+                if phone_addr:
+                    send_rc_controls_to_phone()
+
+                self.wfile.write(json.dumps({'status': 'ok'}).encode())
+            except Exception as e:
+                self.wfile.write(json.dumps({'status': 'error', 'message': str(e)}).encode())
             
         elif path == '/api/arm':
             # API endpoint for arm/disarm
@@ -268,6 +375,14 @@ class RCHTTPHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({'status': 'ok'}).encode())
             
+        elif path == '/api/get_controls':
+            # ESP32/phone pull endpoint
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+
+            self.wfile.write(rc_controls.to_json().encode())
+
         elif path == '/phone/telemetry':
             # Phone telemetry endpoint
             content_length = int(self.headers.get('Content-Length', 0))
